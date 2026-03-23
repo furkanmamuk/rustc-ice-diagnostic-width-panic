@@ -1,0 +1,45 @@
+name: ICE reproduction
+
+on: [push]
+
+jobs:
+  # Test 1: Does CI naturally trigger the ICE (no TTY)?
+  natural:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Check terminal width detection
+        run: |
+          echo "=== tty check ==="
+          tty || true
+          stty size 2>/dev/null || echo "stty: no tty"
+          python3 -c "import os; print('cols:', os.get_terminal_size().columns)" 2>/dev/null || echo "python3: no terminal"
+          echo "=== TERM=$TERM ==="
+      - name: cargo check (natural, no env override)
+        run: cargo check 2>&1 || true
+
+  # Test 2: Force width=0 (confirmed reproduction)
+  forced-width-0:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: cargo check with CARGO_TERM_WIDTH=0
+        run: CARGO_TERM_WIDTH=0 cargo check 2>&1 || true
+      - name: rustc bare with --diagnostic-width=0
+        run: rustc +1.94.0 --edition=2021 --crate-type lib --diagnostic-width=0 src/lib.rs --out-dir /tmp/out 2>&1 || true
+
+  # Test 3: Various widths
+  width-sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - name: Test widths 0-15
+        run: |
+          for w in 0 1 5 10 11 15; do
+            echo "=== width=$w ==="
+            rustc +1.94.0 --edition=2021 --crate-type lib --diagnostic-width=$w src/lib.rs --out-dir /tmp/out 2>&1 | tail -3
+            echo "exit: $?"
+          done
