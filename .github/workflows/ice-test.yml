@@ -3,29 +3,31 @@ name: ICE reproduction
 on: [push]
 
 jobs:
-  ice-repro:
+  # Pinpoint: which versions ICE?
+  version-bisect:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["1.85.0", "1.86.0", "1.87.0", "1.88.0", "1.89.0", "1.90.0", "1.91.0", "1.92.0", "1.93.0", "1.94.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustc ${{ matrix.version }}
+        run: rustup toolchain install ${{ matrix.version }} --profile minimal
+      - name: "rustc ${{ matrix.version }} --diagnostic-width=0"
+        run: |
+          rustc +${{ matrix.version }} --edition=2021 --crate-type lib --diagnostic-width=0 src/lib.rs --out-dir /tmp/out 2>&1
+
+  # Pinpoint: which widths ICE?
+  width-threshold:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        width: [0, 1, 5, 8, 9, 10, 11, 15, 20, 80]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94.0
-
-      - name: "rustc 1.94.0 --diagnostic-width=0 (should ICE)"
+      - name: "rustc 1.94.0 --diagnostic-width=${{ matrix.width }}"
         run: |
-          rustc +1.94.0 --edition=2021 --crate-type lib --diagnostic-width=0 src/lib.rs --out-dir /tmp/out 2>&1
-          echo "exit: $?"
-
-      - name: "rustc 1.93.0 --diagnostic-width=0 (should be OK)"
-        if: always()
-        run: |
-          rustup toolchain install 1.93.0 --profile minimal
-          rustc +1.93.0 --edition=2021 --crate-type lib --diagnostic-width=0 src/lib.rs --out-dir /tmp/out 2>&1
-          echo "exit: $?"
-
-      - name: "Width threshold sweep"
-        if: always()
-        run: |
-          for w in 0 5 10 11 15 80; do
-            echo "=== --diagnostic-width=$w ==="
-            rustc +1.94.0 --edition=2021 --crate-type lib --diagnostic-width=$w src/lib.rs --out-dir /tmp/out 2>&1 && echo "OK" || echo "ICE (exit $?)"
-            echo
-          done
+          rustc +1.94.0 --edition=2021 --crate-type lib --diagnostic-width=${{ matrix.width }} src/lib.rs --out-dir /tmp/out 2>&1

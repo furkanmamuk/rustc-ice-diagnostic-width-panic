@@ -1,10 +1,13 @@
-# rustc ICE: `annotate_snippets::StyledBuffer::replace` panics on narrow diagnostic width
+# rustc ICE: `StyledBuffer::replace` panics on narrow diagnostic width
 
 ## Summary
 
-`rustc` 1.94.0+ panics when rendering any `unused_mut` lint where the variable name is 7+ characters, if `--diagnostic-width` is 10 or less. The crash is in `annotate-snippets` 0.12.10's `StyledBuffer::replace`, which computes an inverted slice range when terminal width is too small.
+`rustc` 1.92.0+ panics when rendering any `unused_mut` lint where the variable name is 7+ characters, if `--diagnostic-width` is less than 10. The crash is in `StyledBuffer::replace`, which computes an inverted slice range when terminal width is too small.
 
-This affects any environment where terminal width auto-detection returns 0 -- non-interactive shells, CI without a PTY, piped output with no TTY, etc.
+- **1.92.0-1.93.0**: crash in `rustc_errors::styled_buffer::StyledBuffer::replace` (HumanEmitter)
+- **1.94.0+**: crash in `annotate_snippets::renderer::styled_buffer::StyledBuffer::replace` (AnnotateSnippetEmitter)
+
+This affects any environment where terminal width auto-detection returns 0 -- primarily WSL2 non-interactive invocations where `/dev/tty` reports size 1x1.
 
 ```
 thread 'rustc' panicked at library/alloc/src/vec/mod.rs:2873:36:
@@ -14,11 +17,15 @@ slice index starts at 13 but ends at 11
 ## Reproduce
 
 ```bash
-rustup toolchain install 1.94.0
-
 # Minimal -- one line of valid Rust:
 echo 'pub fn f() { let mut foo_bar = 0; }' > ice.rs
+
+# ICEs on 1.92.0+:
+rustc +1.92.0 --edition=2021 --crate-type lib --diagnostic-width=0 ice.rs
 rustc +1.94.0 --edition=2021 --crate-type lib --diagnostic-width=0 ice.rs
+
+# OK on 1.91.0:
+rustc +1.91.0 --edition=2021 --crate-type lib --diagnostic-width=0 ice.rs
 ```
 
 Expected: compiles with `unused_mut` warning.
@@ -27,23 +34,23 @@ Actual: ICE.
 ### What triggers it
 
 - Any `unused_mut` lint where the variable name is **7+ characters**
-- `--diagnostic-width` is **10 or less** (including 0)
+- `--diagnostic-width` is **less than 10** (including 0)
 - That's it. No special types, no async, no `#[cfg]`, no dependencies.
 
-The 7-character threshold comes from the annotation span width needing to exceed 10 display columns for `annotate-snippets` to enter the span-trimming codepath. The `unused_mut` suggestion underlines `mut aaaaaaa` = 12 columns (> 10).
+The 7-character threshold comes from the annotation span width needing to exceed 10 display columns to enter the span-trimming codepath. The `unused_mut` suggestion underlines `mut aaaaaaa` = 12 columns (> 10).
 
 ### Width threshold
 
 | `--diagnostic-width` | Result |
 |---|---|
-| 0–10 | ICE |
-| **11+** | OK |
+| 0-9 | ICE |
+| **10+** | OK |
 
 ## Root cause
 
 ### The vulnerable code
 
-**`annotate-snippets` 0.12.10, `src/renderer/render.rs:1392`** -- trims long annotations for narrow terminals:
+Both `rustc_errors::StyledBuffer::replace` (used by HumanEmitter in 1.92-1.93) and `annotate_snippets::StyledBuffer::replace` (used by AnnotateSnippetEmitter in 1.94+) have the same bug. The caller trims long annotations for narrow terminals:
 
 ```rust
 let width = annotation.end.display - annotation.start.display;
@@ -53,19 +60,19 @@ if width > margin.term_width * 2 && width > 10 {
         line_offset,
         annotation.start.display + pad,   // start
         annotation.end.display - pad,       // end
-        renderer.decor_style.margin(),      // "..."
+        "...",
     );
 }
 ```
 
 When `term_width` is 0:
-- `width > 0 * 2` → true for any non-zero span (guard is bypassed)
+- `width > 0 * 2` -- true for any non-zero span (guard is bypassed)
 - `pad = max(0 / 3, 5) = 5`
-- `start = annotation.start.display + 5` → e.g. 13
-- `end = annotation.end.display - 5` → e.g. 8
+- `start = annotation.start.display + 5` -- e.g. 13
+- `end = annotation.end.display - 5` -- e.g. 8
 - `start > end` -- inverted range
 
-**`src/renderer/styled_buffer.rs:109`** -- no guard on the range:
+The `replace()` method has no guard on the range:
 
 ```rust
 let _ = self.lines[line].drain(start..(end - string.chars().count()));
@@ -80,27 +87,32 @@ This bug was originally found in a 155-line async fn that used `#[cfg(windows)]`
 2. The variable name (`env_vars`, 8 chars) was long enough to exceed the 10-column threshold
 3. The async/OsString/Send combination was necessary for the *original* code but not for the bug itself
 
-The actual trigger is just **any `unused_mut` warning with a 7+ char variable name at `diagnostic-width <= 10`**.
+The actual trigger is just **any `unused_mut` warning with a 7+ char variable name at `diagnostic-width < 10`**.
 
 ## Version bisect
 
-| Toolchain | Result |
-|-----------|--------|
-| 1.92.0 | OK |
-| 1.93.0 | OK |
-| **1.94.0** | **ICE** |
-| 1.95.0-beta.4 | ICE |
-| 1.96.0-nightly (2026-03-21) | ICE |
+| Toolchain | Result | Crash location |
+|-----------|--------|----------------|
+| 1.91.0 | OK | -- |
+| **1.92.0** | **ICE** | `rustc_errors::StyledBuffer::replace` (HumanEmitter) |
+| **1.93.0** | **ICE** | `rustc_errors::StyledBuffer::replace` (HumanEmitter) |
+| **1.94.0** | **ICE** | `annotate_snippets::StyledBuffer::replace` (AnnotateSnippetEmitter) |
+| 1.95.0-beta.4 | ICE | annotate_snippets |
+| 1.96.0-nightly | ICE | annotate_snippets |
 
-### Nightly bisect (`cargo-bisect-rustc`)
+### Nightly bisect: 1.91 -> 1.92 (`cargo-bisect-rustc`)
 
 ```
-searched nightlies: nightly-2025-11-01 to nightly-2026-01-20
-regressed nightly:  nightly-2025-11-23
-regressed commit:   rust-lang/rust@5934b06
+searched nightlies: from nightly-2025-08-01 to nightly-2025-10-30
+regressed nightly:  nightly-2025-10-13
+regressed commit:   rust-lang/rust@ff6dc928
 ```
 
-The regressing nightly falls between [#148984](https://github.com/rust-lang/rust/pull/148984) ("Update annotate-snippets to 0.12.9", merged Nov 16) and [#149529](https://github.com/rust-lang/rust/pull/149529) ("Update annotate-snippets to 0.12.10", merged Dec 2). The `StyledBuffer::replace` method was introduced in the 0.12.x series and did not exist in 0.11.x (used by 1.93.0).
+The regressing commit is the auto-merge of [#142390](https://github.com/rust-lang/rust/pull/142390) ("Perform unused assignment and unused variables lints on MIR", merged Oct 12, 2025). This changed how `unused_mut` annotations are structured, causing them to hit the pre-existing bug in `StyledBuffer::replace` at small terminal widths.
+
+### Why 1.94.0 uses a different code path
+
+In 1.94.0, the default diagnostic emitter switched from `HumanEmitter` to `AnnotateSnippetEmitter` via [#150032](https://github.com/rust-lang/rust/pull/150032). The annotate-snippets crate has its own copy of `StyledBuffer::replace` with the same bug. On current rustc main, the old `styled_buffer.rs` has been removed entirely -- only the annotate-snippets path remains.
 
 ## Investigation: why it looked environment-specific
 
@@ -145,19 +157,19 @@ $ stty size < /dev/tty  # on WSL2 host (non-interactive)
 1 1
 ```
 
-Non-interactive WSL2 invocations (from Windows `wsl -e`) report `/dev/tty` size as 1×1. rustc detects this and sets `diagnostic-width=0`, triggering the bug.
+Non-interactive WSL2 invocations (from Windows `wsl -e`) report `/dev/tty` size as 1x1. rustc detects this and sets `diagnostic-width=0`, triggering the bug.
 
 | Environment | `/dev/tty` | Auto-detected width | Result |
 |---|---|---|---|
-| WSL2 host (non-interactive) | 1×1 | 0 | ICE |
+| WSL2 host (non-interactive) | 1x1 | 0 | ICE |
 | Docker (no `/dev/tty`) | n/a | default (~140) | OK |
 | SSH to Linux VPS | real terminal | 80+ | OK |
 | Any Linux + `--diagnostic-width=0` | irrelevant | forced 0 | ICE |
 
-## Backtrace
+## Backtraces
 
 <details>
-<summary>Click to expand</summary>
+<summary>1.94.0 (AnnotateSnippetEmitter)</summary>
 
 ```
  0: <std::sys::backtrace::BacktraceLock::print::DisplayBacktrace as core::fmt::Display>::fmt
@@ -176,66 +188,32 @@ Non-interactive WSL2 invocations (from Windows `wsl -e`) report `/dev/tty` size 
 13: annotate_snippets::renderer::render::render
 14: <rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter>::emit_messages_default
 15: <AnnotateSnippetEmitter as rustc_errors::emitter::Emitter>::emit_diagnostic
-16: <rustc_errors::DiagCtxtInner>::emit_diagnostic::{closure#3}
-17: rustc_interface::callbacks::track_diagnostic::<Option<ErrorGuaranteed>>
-18: <rustc_errors::DiagCtxtInner>::emit_diagnostic
-19: <rustc_errors::DiagCtxtHandle>::emit_diagnostic
-20: <() as rustc_errors::diagnostic::EmissionGuarantee>::emit_producing_guarantee
-21: rustc_middle::lint::lint_level::lint_level_impl
-22: rustc_borrowck::borrowck_check_region_constraints
-23: <rustc_borrowck::root_cx::BorrowCheckRootCtxt>::do_mir_borrowck
 ```
 
 </details>
 
-## Suggested fix
+<details>
+<summary>1.92.0 (HumanEmitter)</summary>
 
-Two changes in [`rust-lang/annotate-snippets-rs`](https://github.com/rust-lang/annotate-snippets-rs). Bug is present on `main` (latest 0.12.13).
-
-**1. `src/renderer/render.rs`** -- don't enter the trimming path when `term_width == 0`, guard inverted ranges:
-
-```diff
--        if width > margin.term_width * 2 && width > 10 {
-+        if margin.term_width > 0 && width > margin.term_width * 2 && width > 10 {
-             let pad = max(margin.term_width / 3, 5);
--            buffer.replace(
--                line_offset,
--                annotation.start.display + pad,
--                annotation.end.display - pad,
--                renderer.decor_style.margin(),
--            );
--            buffer.replace(
--                line_offset + 1,
--                annotation.start.display + pad,
--                annotation.end.display - pad,
--                renderer.decor_style.margin(),
--            );
-+            let replace_start = annotation.start.display + pad;
-+            let replace_end = annotation.end.display.saturating_sub(pad);
-+            if replace_start < replace_end {
-+                buffer.replace(line_offset, replace_start, replace_end, ...);
-+                buffer.replace(line_offset + 1, replace_start, replace_end, ...);
-+            }
-         }
+```
+12: core::slice::index::slice_index_fail
+13: core::slice::index::slice_index_fail
+14: <rustc_errors::styled_buffer::StyledBuffer>::replace
+15: <rustc_errors::emitter::HumanEmitter>::emit_messages_default_inner::{closure#0}
+16: <rustc_errors::emitter::HumanEmitter as rustc_errors::emitter::Emitter>::emit_diagnostic
 ```
 
-**2. `src/renderer/styled_buffer.rs`** -- defensive bounds checking in `replace()`:
+</details>
 
-```diff
--        if start == end {
-+        if start >= end {
-             return;
-         }
-         ...
--        let _ = self.lines[line].drain(start..(end - string.chars().count()));
-+        let drain_end = end.saturating_sub(string.chars().count());
-+        if drain_end <= start {
-+            return;
-+        }
-+        let _ = self.lines[line].drain(start..drain_end);
-```
+## Fix status
 
-Both changes verified: all 205 tests pass in `annotate-snippets` 0.12.10 with a new regression test for `term_width=0`.
+- **annotate-snippets (affects 1.94.0+)**: [PR #392](https://github.com/rust-lang/annotate-snippets-rs/pull/392) -- guards inverted ranges in `StyledBuffer::replace` and skips trimming when `term_width == 0`
+- **rustc_errors (affects 1.92.0-1.93.0)**: `styled_buffer.rs` was removed from rustc main when the emitter switched to annotate-snippets. A backport would need to patch the old `StyledBuffer::replace` with the same fix.
+
+## Tracked issues
+
+- rustc: https://github.com/rust-lang/rust/issues/154258
+- annotate-snippets: https://github.com/rust-lang/annotate-snippets-rs/issues/391
 
 ## Platform info
 
@@ -255,5 +233,5 @@ RUSTFLAGS="--diagnostic-width=80" cargo build
 RUSTFLAGS="-A unused-mut" cargo build
 
 # Pin to the last working toolchain
-rustup override set 1.93.0
+rustup override set 1.91.0
 ```

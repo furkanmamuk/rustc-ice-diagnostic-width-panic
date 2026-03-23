@@ -71,33 +71,52 @@ note: rustc 1.94.0 (4a4ef493e 2026-03-02) running on x86_64-unknown-linux-gnu
 ## Trigger conditions
 
 - Any `unused_mut` warning where the variable name is 7+ characters (the lint's underline spans 12+ display columns)
-- `--diagnostic-width` is 10 or less (including 0, the auto-detected value when there is no TTY)
+- `--diagnostic-width` is less than 10 (including 0, the auto-detected value when there is no TTY)
 
-This is hit in practice by non-interactive environments: CI without a PTY, `wsl -e` invocations, piped output through tools that don't allocate a terminal, etc.
+This is hit in practice by non-interactive WSL2 invocations (`wsl -e bash -c ...`), where `/dev/tty` reports size 1x1 and rustc auto-detects width as 0.
 
 The crash also produces a secondary `delayed_bug` about `OpaqueTypeKey` / `ProvisionalHiddenType`, but this is collateral damage from the panic aborting the borrow checker -- not an independent type system bug.
 
 ## Regression
 
-Regression in **1.94.0** (works on 1.93.0). Nightly bisect points to the annotate-snippets 0.12.x upgrade: [#148984](https://github.com/rust-lang/rust/pull/148984) (0.12.9, merged Nov 16) and [#149529](https://github.com/rust-lang/rust/pull/149529) (0.12.10, merged Dec 2). The `StyledBuffer::replace` method was introduced in 0.12.x.
+Regression in **1.92.0** (works on 1.91.0). Two bisections:
+
+**Bisect 1: 1.91.0 -> 1.92.0 (the actual regression)**
 
 ```
-searched nightlies: nightly-2025-11-01 to nightly-2026-01-20
-regressed nightly:  nightly-2025-11-23
+searched nightlies: from nightly-2025-08-01 to nightly-2025-10-30
+regressed nightly: nightly-2025-10-13
+regressed commit: rust-lang/rust@ff6dc928
 ```
+
+The regressing commit is the auto-merge of [#142390](https://github.com/rust-lang/rust/pull/142390) ("Perform unused assignment and unused variables lints on MIR"), which changed how `unused_mut` annotations are structured. This caused them to hit a pre-existing bug in `StyledBuffer::replace` at small terminal widths.
+
+**Bisect 2: emitter switch in 1.94.0**
+
+In 1.94.0, the crash moved from `rustc_errors::StyledBuffer::replace` (HumanEmitter) to `annotate_snippets::StyledBuffer::replace` (AnnotateSnippetEmitter) due to the emitter switch in [#150032](https://github.com/rust-lang/rust/pull/150032). Both `StyledBuffer::replace` implementations have the same bug.
+
+| Version | ICE? | Crash location |
+|---------|------|----------------|
+| 1.91.0 | No | -- |
+| **1.92.0** | **Yes** | `rustc_errors::StyledBuffer::replace` (HumanEmitter) |
+| **1.93.0** | **Yes** | `rustc_errors::StyledBuffer::replace` (HumanEmitter) |
+| **1.94.0** | **Yes** | `annotate_snippets::StyledBuffer::replace` (AnnotateSnippetEmitter) |
 
 ## Root cause
 
-The bug is in `annotate-snippets` 0.12.10-0.12.13 (still present on main), not in rustc itself. The span-trimming logic in `annotate_snippets::renderer::render` computes an inverted range when `term_width` is 0, and `StyledBuffer::replace` panics on it.
+The bug is in `StyledBuffer::replace` -- it doesn't guard against inverted ranges. The span-trimming logic computes `start + pad` and `end - pad`, which produces `start > end` when `term_width` is 0 or very small. The `replace()` method then panics on the inverted drain range.
+
+On current rustc main, the old `rustc_errors::styled_buffer.rs` has been removed (emitter fully switched to annotate-snippets), so the fix only needs to land in annotate-snippets.
 
 Filed upstream: https://github.com/rust-lang/annotate-snippets-rs/issues/391
+Fix PR: https://github.com/rust-lang/annotate-snippets-rs/pull/392
 
 ## Workarounds
 
 ```bash
 RUSTFLAGS="--diagnostic-width=80" cargo build   # explicit width
 RUSTFLAGS="-A unused-mut" cargo build            # suppress the lint
-rustup override set 1.93.0                       # pin toolchain
+rustup override set 1.91.0                       # pin toolchain
 ```
 
 ## Reproducer repo
